@@ -1,0 +1,1526 @@
+========================================================================
+BELAJAR CASSANDRA & CQL - DARI HULU KE HILIR
+========================================================================
+
+PETA BELAJAR (ikuti urutan ini):
+
+KONSEP DASAR
+   -> DDL (Keyspace -> Replication -> Table -> Primary Key -> Alter/Drop)
+   -> TIPE DATA (Dasar -> Koleksi -> Tuple -> UDT -> Counter)
+   -> DML (Insert -> Update -> Delete -> TTL -> LWT -> Batch)
+   -> DQL (Select -> Where -> Order By -> Limit -> Allow Filtering)
+   -> DATA MODELING (Query-first -> Index -> Materialized View)
+   -> FITUR LANJUTAN (Function -> Aggregate -> Trigger)
+   -> DCL (Role -> Grant -> Revoke)
+   -> OPERASIONAL (cqlsh -> nodetool -> Compaction -> Repair -> Backup)
+
+Cara pakai file ini:
+- Baris yang diawali "--" adalah komentar CQL (boleh di-copy paste ke cqlsh)
+- Jalankan contoh secara berurutan karena contoh bab berikutnya memakai tabel dari bab sebelumnya
+- Buka terminal: cqlsh  (kalau pakai auth: cqlsh -u cassandra -p cassandra)
+
+
+========================================================================
+BAB 0 - KONSEP DASAR (WAJIB DIPAHAMI SEBELUM NULIS QUERY)
+========================================================================
+
+Cassandra BUKAN database relasional. Dia dirancang untuk data sangat besar,
+tersebar di banyak server, dan tidak boleh mati (high availability).
+Itu sebabnya aturan query nya beda dari SQL (MySQL / PostgreSQL).
+
+0.1 Istilah arsitektur
+----------------------
+Node        -> satu server / instance Cassandra
+Cluster     -> kumpulan node yang bekerja bersama
+Ring        -> susunan melingkar node di dalam cluster (tidak ada node "master", semua setara)
+Datacenter  -> kelompok node berdasarkan lokasi (contoh: dc_jakarta, dc_singapura)
+
+0.2 Partitioner, Token Ring, dan Cara Kerja Partition Key (VERSI DETAIL)
+------------------------------------------------------------------------
+Bagian ini adalah inti kenapa Cassandra bisa cepat dan tersebar. Dibagi 8 langkah:
+
+    A. Ruang token (ring)
+    B. Pembagian ring ke node (token range)
+    C. Bagaimana partition key diubah jadi token (hashing)
+    D. Bagaimana token menentukan node tujuan (write)
+    E. Bagaimana data ditemukan lagi saat READ
+    F. Partition key + composite key (dua kolom atau lebih)
+    G. Clustering key: BUKAN bagian dari hashing
+    H. Kenapa aturan WHERE Cassandra begitu
+
+------------------------------------------------------------------------
+A. RUANG TOKEN (RING)
+------------------------------------------------------------------------
+Partitioner = komponen yang mengubah partition key menjadi angka (TOKEN)
+Partitioner default modern: Murmur3Partitioner
+
+Token = bilangan bulat 64-bit bertanda (signed)
+Rentang token Murmur3:
+
+    -9223372036854775808  sampai  +9223372036854775807
+    (-2^63)                        (2^63 - 1)
+
+Bayangkan angka-angka ini disusun MELINGKAR (bukan garis lurus):
+setelah angka paling besar, kembali lagi ke angka paling kecil. Inilah "RING".
+
+------------------------------------------------------------------------
+B. PEMBAGIAN RING KE NODE (TOKEN RANGE)
+------------------------------------------------------------------------
+Setiap node diberi satu (atau banyak) angka TOKEN. Token node itu menandai ujung kekuasaan nya.
+
+ATURAN KEPEMILIKAN:
+Sebuah node memiliki semua token dari (token node sebelumnya, token node itu sendiri]
+Artinya: ujung kiri TIDAK ikut, ujung kanan IKUT.
+
+Contoh MAINAN (supaya mudah dibayangkan): anggap ring hanya berisi angka 1 sampai 100, ada 4 node
+
+        N1 (token 25)  -> memiliki token  1  sampai 25
+        N2 (token 50)  -> memiliki token 26  sampai 50
+        N3 (token 75)  -> memiliki token 51  sampai 75
+        N4 (token 100) -> memiliki token 76  sampai 100
+
+Gambar ring nya:
+
+                    N4(100)
+                  /         \
+             N1(25)         N3(75)
+                  \         /
+                    N2(50)
+
+Di Cassandra asli angka nya jauh lebih besar (-2^63 s/d 2^63-1) dan token biasanya tidak
+rapi seperti 25/50/75/100, tapi logika nya SAMA.
+
+Virtual Nodes (vnodes)
+- Kalau 1 node hanya punya 1 token, saat ada node baru atau node mati, beban hanya pindah ke tetangga nya
+- Solusi: 1 node punya BANYAK token (vnodes), dipecah-pecah acak di seluruh ring
+- Diatur di cassandra.yaml:  num_tokens  (default versi baru = 16, versi lama = 256)
+- Efek nya: tiap node memiliki banyak potongan kecil ring, beban lebih merata dan penambahan node lebih mulus
+
+Siapa yang tahu peta ring ini?
+- SETIAP node menyimpan peta lengkap "token range -> node" (disebarkan lewat protokol GOSSIP)
+- Karena itu TIDAK ADA node pusat / master yang perlu ditanya "data X ada di mana"
+- Driver (aplikasi) juga bisa mengambil peta ini dari cluster (token-aware routing)
+
+------------------------------------------------------------------------
+C. BAGAIMANA PARTITION KEY DIUBAH JADI TOKEN (HASHING)
+------------------------------------------------------------------------
+Misal tabel:
+    CREATE TABLE users (id uuid PRIMARY KEY, nama text);
+
+Saat INSERT INTO users (id, nama) VALUES (..., 'Budi'), ini yang terjadi secara teknis:
+
+Langkah 1 - SERIALISASI
+    Nilai partition key (kolom "id") diubah menjadi urutan byte sesuai tipe data nya
+    (uuid -> 16 byte, text -> byte UTF-8, int -> 4 byte, dst)
+
+Langkah 2 - HASH
+    Byte tersebut dimasukkan ke fungsi hash MurmurHash3 (varian 128-bit)
+    Cassandra mengambil 64 bit dari hasilnya sebagai TOKEN (angka bertanda 64-bit)
+
+    byte(partition key) --Murmur3--> TOKEN (contoh: 7081235523874103562)
+
+Sifat hash yang penting:
+a. DETERMINISTIK : partition key yang sama SELALU menghasilkan token yang sama (kapan pun, di node mana pun)
+b. MERATA         : hasil nya tersebar acak dan seragam di seluruh rentang ring, maka data terbagi rata ke semua node
+c. TIDAK BERURUTAN: key yang "mirip" (misal 1001 dan 1002) hasil token nya SANGAT BERBEDA dan tersebar
+                    (akibatnya: Cassandra tidak bisa melakukan range query pada partition key, lihat bagian H)
+
+Bukti bisa dilihat sendiri di cqlsh:
+    SELECT id, token(id) FROM users;
+    -- kolom token(id) menampilkan angka hasil hash dari kolom partition key
+
+Catatan: untuk penjelasan di bawah, angka token memakai angka mainan 1-100 (bukan hasil Murmur3 asli).
+
+------------------------------------------------------------------------
+D. BAGAIMANA TOKEN MENENTUKAN NODE TUJUAN (PROSES WRITE)
+------------------------------------------------------------------------
+Contoh: INSERT satu baris dengan partition key 'Budi' (anggap hash -> token 62)
+
+1. Aplikasi mengirim query ke SALAH SATU node
+   Node yang menerima disebut COORDINATOR. Bisa node mana saja (tidak harus node yang menyimpan data)
+   (driver yang token-aware akan memilih langsung node pemilik data sebagai coordinator, supaya lebih cepat)
+
+2. Coordinator menghitung token dari partition key
+   token('Budi') = 62
+
+3. Coordinator melihat peta ring
+   token 62 jatuh di rentang 51-75 -> pemilik nya N3
+   N3 = REPLIKA PERTAMA (primary replica)
+
+4. Replika lain ditentukan dari Replication Factor (RF) dan strategi replikasi
+   SimpleStrategy dengan RF=3 : ambil node berikutnya SEARAH jarum jam pada ring
+       N3 (pemilik) -> N4 -> N1       (setelah N4 kembali ke N1 karena ring melingkar)
+   NetworkTopologyStrategy    : sama, tapi dihitung per datacenter dan berusaha menyebar ke rack berbeda
+
+5. Coordinator mengirim data ke ketiga replika (N3, N4, N1) sekaligus
+   Ia menunggu sesuai CONSISTENCY LEVEL:
+       CL = ONE    -> cukup 1 replika membalas "sukses"
+       CL = QUORUM -> 2 dari 3 replika harus membalas
+
+6. Pada tiap replika terjadi: commitlog -> memtable -> (nanti) SSTable (lihat 0.5 Write Path)
+
+Gambar alur nya:
+
+   Aplikasi --> [Coordinator: N2] --hitung token(Budi)=62--> lihat peta ring
+                                                          |
+                                         pemilik = N3, lalu N4, N1 (RF=3)
+                                                          |
+                        N2 kirim ke N3, N4, N1 --> tunggu sesuai CL --> balas ke aplikasi
+
+------------------------------------------------------------------------
+E. BAGAIMANA DATA DITEMUKAN LAGI SAAT READ
+------------------------------------------------------------------------
+Ini bagian yang sering membingungkan: "Cassandra tidak menyimpan daftar 'data X ada di node Y', lalu
+bagaimana ia tahu harus ke mana saat membaca?"
+
+JAWABAN: TIDAK PERLU daftar. Lokasi data DIHITUNG ULANG dari partition key, dengan cara yang sama persis seperti saat menulis.
+
+Contoh: SELECT * FROM users WHERE id = <id milik Budi>;
+
+1. Coordinator menerima query, mengambil nilai partition key dari WHERE
+2. Ia menjalankan hash yang SAMA (Murmur3) -> token SAMA (62) -> karena hash deterministik
+3. Ia melihat peta ring -> token 62 milik N3, dengan replika N4 dan N1
+4. Coordinator mengirim permintaan baca ke replika sesuai CL
+       CL = ONE    -> bertanya ke 1 replika (biasanya yang paling cepat / paling dekat)
+       CL = QUORUM -> bertanya ke 2 replika, lalu membandingkan
+5. Jika jawaban replika berbeda, data dengan TIMESTAMP paling baru yang dipilih (dan replika yang ketinggalan
+   akan diperbaiki otomatis, disebut READ REPAIR)
+6. Hasil dikirim kembali ke aplikasi
+
+Di dalam replika (setelah query sampai di node pemilik data), pencarian nya seperti ini:
+   a. Cek MEMTABLE (data terbaru yang masih di memori)
+   b. Untuk tiap SSTable di disk:
+        - BLOOM FILTER : pengecekan cepat "apakah partisi ini MUNGKIN ada di SSTable ini?"
+                         (kalau jawabannya pasti TIDAK, SSTable itu dilewati tanpa membaca disk)
+        - PARTITION INDEX : mencari posisi byte partisi itu di file SSTable
+        - Baca partisi itu, lalu cari baris yang cocok memakai CLUSTERING KEY (karena sudah terurut)
+   c. Gabungkan hasil dari memtable dan semua SSTable, pilih nilai dengan timestamp terbaru
+      (tombstone ikut diperhitungkan)
+
+Kesimpulan: dua lapis penentuan lokasi
+   LAPIS 1 (antar node)    : HITUNG token dari partition key -> tahu NODE nya (tanpa pencarian, tanpa tanya master)
+   LAPIS 2 (dalam 1 node)  : bloom filter + partition index -> tahu POSISI di disk
+
+Karena Lapis 1 hanya butuh perhitungan, query berdasarkan partition key hampir tidak punya biaya "pencarian".
+
+------------------------------------------------------------------------
+F. PARTITION KEY + COMPOSITE KEY (KOMBINASI BEBERAPA KOLOM)
+------------------------------------------------------------------------
+Ada dua bentuk yang sering tertukar:
+
+Bentuk 1: PRIMARY KEY (a, b, c)
+    Partition key = a SAJA
+    Clustering key = b, c
+    Yang di-hash hanya kolom a
+
+Bentuk 2: PRIMARY KEY ((a, b), c)
+    Partition key = GABUNGAN a dan b  (disebut COMPOSITE PARTITION KEY)
+    Clustering key = c
+    Yang di-hash adalah gabungan a + b
+
+Perhatikan kurung DOUBLE ((a, b)): itulah penanda composite partition key.
+
+Bagaimana composite partition key di-hash?
+-> Nilai a dan b TIDAK di-hash terpisah. Keduanya digabung dulu menjadi SATU urutan byte, baru di-hash SEKALI.
+
+Secara teknis (disederhanakan):
+    Langkah 1: serialisasi tiap komponen jadi byte
+    Langkah 2: gabungkan jadi satu byte array berformat composite
+               [panjang a][byte a][penanda akhir] [panjang b][byte b][penanda akhir]
+               (panjang dan penanda dipakai supaya ('ab','c') tidak sama dengan ('a','bc'))
+    Langkah 3: Murmur3(byte array gabungan) -> SATU token
+
+    token = Murmur3( serialisasi(a) + serialisasi(b) )
+
+Contoh nyata dengan tabel dari Bab 1:
+
+    CREATE TABLE sensor_by_hari (
+        sensor_id uuid,
+        tanggal   date,
+        waktu     timestamp,
+        suhu      double,
+        PRIMARY KEY ((sensor_id, tanggal), waktu)
+    );
+
+Misal ada 2 partisi (angka token mainan 1-100):
+
+    sensor_id = S1, tanggal = 2026-10-30  -> Murmur3 -> token 18 -> milik N1
+    sensor_id = S1, tanggal = 2026-10-31  -> Murmur3 -> token 83 -> milik N4
+
+Perhatikan: SENSOR YANG SAMA (S1), tapi karena tanggal berbeda, hash nya BERBEDA dan
+data nya jatuh di NODE YANG BERBEDA. Inilah tujuan bucketing:
+data 1 sensor tersebar ke banyak node dan partisi tidak membengkak.
+
+Bandingkan dengan jika PRIMARY KEY (sensor_id, waktu):
+    Hanya sensor_id yang di-hash -> SEMUA data S1 (bertahun-tahun) menumpuk di SATU partisi / node yang sama.
+
+Akibat pada WHERE:
+Karena hash dihitung dari GABUNGAN semua kolom partition key, maka SEMUA kolom partition key WAJIB ada di WHERE.
+
+    -- BENAR: kedua kolom partition key lengkap, token bisa dihitung
+    SELECT * FROM sensor_by_hari
+    WHERE sensor_id = 66666666-6666-6666-6666-666666666666 AND tanggal = '2026-10-30';
+
+    -- SALAH: tanggal tidak ada. Hash dari "sensor_id saja" TIDAK sama dengan hash dari "sensor_id + tanggal",
+    -- jadi Cassandra tidak bisa menghitung token, dan tidak tahu harus ke partisi mana
+    SELECT * FROM sensor_by_hari
+    WHERE sensor_id = 66666666-6666-6666-6666-666666666666;
+    -- Error: Cannot execute this query as it might involve data filtering ...
+
+Cek token nya di cqlsh:
+    SELECT sensor_id, tanggal, token(sensor_id, tanggal) FROM sensor_by_hari;
+    -- token(...) menerima SEMUA kolom partition key sekaligus, sesuai urutan di PRIMARY KEY
+
+------------------------------------------------------------------------
+G. CLUSTERING KEY: BUKAN BAGIAN DARI HASHING
+------------------------------------------------------------------------
+Clustering key TIDAK mempengaruhi token dan TIDAK menentukan node.
+Fungsi nya hanya mengurutkan baris DI DALAM satu partisi (pada file SSTable di disk).
+
+    PRIMARY KEY ((sensor_id, tanggal), waktu)
+                 \___ di-hash ______/  \_ tidak di-hash, hanya pengurut _/
+
+Visual satu partisi di dalam node:
+
+    Partisi (S1, 2026-10-30)   <- ditempatkan berdasarkan token hash
+      waktu 08:00 | suhu 28.1  \
+      waktu 08:01 | suhu 28.2   |  tersimpan BERURUTAN fisik di disk
+      waktu 08:02 | suhu 28.4   |  berdasarkan clustering key
+      waktu 08:03 | suhu 28.3  /
+
+Karena baris sudah terurut di disk:
+- Range query pada clustering key (waktu >= ... AND waktu < ...) hanya membaca satu potongan lurus (sequential read) -> CEPAT
+- ORDER BY pada clustering key hampir tanpa biaya (tinggal baca maju atau mundur)
+- Tapi hanya berlaku DI DALAM satu partisi
+
+Ringkasan peran:
+    PARTITION KEY  -> di-hash -> menentukan NODE (dan partisi mana)
+    CLUSTERING KEY -> tidak di-hash -> menentukan URUTAN BARIS di dalam partisi
+
+------------------------------------------------------------------------
+H. KENAPA ATURAN WHERE CASSANDRA BEGITU
+------------------------------------------------------------------------
+Semua aturan yang kamu pelajari di Bab 4 sebenarnya turunan dari mekanisme di atas:
+
+1. "WHERE harus pakai partition key (= atau IN)"
+   -> Token hanya bisa dihitung kalau nilai partition key LENGKAP diketahui.
+      Tanpa itu, Cassandra tidak tahu node mana yang harus ditanya.
+
+2. "Partition key tidak boleh range (>, <)"
+   -> Hash tidak berurutan. Key 1001 dan 1002 punya token yang berjauhan dan di node berbeda.
+      "Semua key antara 1000 dan 2000" tidak berupa potongan yang berdekatan di ring.
+      (Yang berurutan hanya TOKEN, makanya ada fungsi token(): WHERE token(id) > 100 ... untuk scan per rentang token)
+
+3. "Clustering key boleh range dan ORDER BY, tapi harus berurutan dari kiri"
+   -> Karena clustering key tersimpan terurut di disk dalam partisi, range = baca satu potongan lurus.
+
+4. "Query tanpa partition key = lambat / ditolak / butuh ALLOW FILTERING"
+   -> Tidak ada token yang bisa dihitung, jadi koordinator harus menanyai SEMUA node dan SEMUA token range,
+      lalu membaca banyak partisi dan menyaring hasilnya. Mahal, tidak scalable.
+
+5. "Partition key sebaiknya tersebar rata (kardinalitas tinggi)"
+   -> Hash membagi rata KEY yang berbeda. Kalau 90% baris memakai partition key yang sama,
+      semuanya punya token yang sama dan menumpuk di satu node saja (HOT PARTITION). Hash tidak bisa menolong
+      kalau key nya sendiri yang tidak bervariasi.
+
+Rangkuman satu baris:
+
+    partition key --serialisasi--> byte --Murmur3--> TOKEN --peta ring--> NODE pemilik + replika
+    (read dan write memakai jalur hitung yang SAMA, makanya data selalu bisa ditemukan lagi tanpa katalog lokasi)
+
+0.3 Replication
+---------------
+- Replication Factor (RF) = berapa salinan data disimpan di node berbeda
+- RF = 3 artinya setiap baris disimpan di 3 node
+- Kalau 1 node mati, data tetap ada di node lain
+
+0.4 Consistency Level (CL)
+--------------------------
+Kita yang menentukan: berapa replika yang harus menjawab sebelum operasi dianggap berhasil
+
+ONE           -> cukup 1 replika (cepat, kurang aman)
+QUORUM        -> mayoritas replika (RF/2 + 1), contoh RF=3 berarti 2 replika
+LOCAL_QUORUM  -> mayoritas, tapi hanya di datacenter lokal (paling umum di produksi multi-DC)
+ALL           -> semua replika (paling aman, tapi kalau 1 node mati langsung gagal)
+ANY           -> khusus write, cukup tercatat di mana saja
+
+Rumus konsistensi kuat:  R + W > RF
+Contoh RF=3, baca QUORUM (2) + tulis QUORUM (2) = 4 > 3, maka pembacaan selalu melihat data terbaru
+
+Set di cqlsh:
+CONSISTENCY QUORUM;
+
+0.5 Write Path (apa yang terjadi saat INSERT)
+---------------------------------------------
+1. Data ditulis ke COMMITLOG (di disk, untuk keamanan kalau crash)
+2. Data ditulis ke MEMTABLE (di memori)
+3. Saat memtable penuh, di-flush menjadi SSTABLE (file di disk, IMMUTABLE / tidak diubah lagi)
+4. Beberapa SSTable digabung secara berkala (COMPACTION)
+
+Kesimpulan penting: Cassandra TIDAK mengubah data lama, dia hanya MENULIS data baru
+dengan timestamp lebih baru. Maka:
+- INSERT dan UPDATE pada dasarnya sama (disebut UPSERT)
+- DELETE tidak langsung menghapus, tapi menulis penanda bernama TOMBSTONE
+
+0.6 Tombstone
+-------------
+- Tombstone = penanda "data ini sudah dihapus"
+- Disimpan selama gc_grace_seconds (default 10 hari = 864000 detik)
+- Terlalu banyak tombstone membuat query lambat, jadi hindari DELETE besar-besaran dan pola "queue"
+
+0.7 Aturan emas Cassandra
+-------------------------
+1. Rancang tabel berdasarkan QUERY yang dibutuhkan, bukan berdasarkan entitas
+2. Satu tabel untuk satu jenis query (data boleh duplikat / denormalisasi)
+3. Tidak ada JOIN, tidak ada subquery, GROUP BY terbatas
+4. WHERE harus memakai partition key
+
+
+========================================================================
+BAB 1 - DDL (DATA DEFINITION LANGUAGE): STRUKTUR WADAH DATA
+========================================================================
+
+URUTAN: Keyspace -> Replication -> USE -> Table -> Primary Key -> Table Options -> Alter -> Truncate -> Drop
+
+------------------------------------------------------------------------
+1.1 KEYSPACE (setara "database" di SQL)
+------------------------------------------------------------------------
+Keyspace adalah wadah tertinggi. Di dalam nya ada table, type, function.
+Di level keyspace inilah REPLICATION diatur.
+
+-- Membuat keyspace untuk belajar (1 node saja, RF = 1)
+CREATE KEYSPACE IF NOT EXISTS belajar_cql
+WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
+AND durable_writes = true;
+
+Penjelasan:
+- IF NOT EXISTS   -> tidak error kalau sudah ada
+- class           -> strategi replikasi (lihat 1.2)
+- durable_writes  -> true berarti commitlog dipakai (default true, jangan dimatikan kecuali tahu risiko nya)
+
+-- Melihat keyspace
+DESCRIBE KEYSPACES;
+DESCRIBE KEYSPACE belajar_cql;
+
+------------------------------------------------------------------------
+1.2 REPLICATION STRATEGY
+------------------------------------------------------------------------
+a. SimpleStrategy
+   - Menaruh replika di node berikutnya pada ring, tanpa peduli datacenter
+   - Hanya untuk belajar / development / 1 datacenter
+
+b. NetworkTopologyStrategy
+   - Menentukan jumlah replika PER DATACENTER
+   - Wajib untuk produksi
+
+-- Contoh produksi: 3 replika di dc_jakarta, 2 replika di dc_singapura
+CREATE KEYSPACE toko_produksi
+WITH replication = {'class': 'NetworkTopologyStrategy', 'dc_jakarta': 3, 'dc_singapura': 2};
+
+-- Mengubah replication (ALTER KEYSPACE)
+ALTER KEYSPACE belajar_cql
+WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
+
+Catatan penting ALTER KEYSPACE:
+- Nama datacenter harus PERSIS sama dengan di cluster (cek dengan: nodetool status)
+- Setelah mengubah replication factor, jalankan "nodetool repair" supaya data tersalin ke replika baru
+
+------------------------------------------------------------------------
+1.3 USE (masuk ke konteks keyspace)
+------------------------------------------------------------------------
+USE belajar_cql;
+
+Setelah USE, kita tidak perlu menulis "belajar_cql.nama_tabel" lagi.
+Alternatif tanpa USE:  SELECT * FROM belajar_cql.users;
+
+------------------------------------------------------------------------
+1.4 TABLE (di Cassandra: Table = ColumnFamily)
+------------------------------------------------------------------------
+-- Tabel paling sederhana
+CREATE TABLE IF NOT EXISTS users (
+    id        uuid,
+    nama      text,
+    email     text,
+    tipe_user text,
+    PRIMARY KEY (id)
+);
+
+-- Cara singkat kalau primary key nya hanya satu kolom
+CREATE TABLE users_singkat (
+    id   uuid PRIMARY KEY,
+    nama text
+);
+
+-- Melihat tabel
+DESCRIBE TABLES;
+DESCRIBE TABLE users;
+
+------------------------------------------------------------------------
+1.5 PRIMARY KEY (BAGIAN PALING PENTING DI CASSANDRA)
+------------------------------------------------------------------------
+PRIMARY KEY terdiri dari 2 bagian:
+
+   PRIMARY KEY ( (PARTITION KEY) , CLUSTERING KEY 1, CLUSTERING KEY 2 )
+
+PARTITION KEY
+- Menentukan data disimpan di NODE mana
+- Semua baris dengan partition key sama berada di satu partisi (satu tempat)
+- Dipakai untuk WHERE (wajib pakai operator = atau IN)
+
+CLUSTERING KEY
+- Menentukan URUTAN baris di dalam satu partisi
+- Dipakai untuk sorting, range query (>, <, BETWEEN), dan ORDER BY
+
+Ada 3 bentuk:
+
+-- Bentuk 1: Partition key tunggal (tanpa clustering)
+-- Satu partisi hanya berisi 1 baris
+PRIMARY KEY (id)
+
+-- Bentuk 2: Partition key + clustering key
+-- Contoh: riwayat pesan, 1 chat = 1 partisi, pesan diurutkan berdasarkan waktu
+CREATE TABLE pesan_by_chat (
+    chat_id  uuid,
+    waktu    timestamp,
+    pengirim text,
+    isi      text,
+    PRIMARY KEY (chat_id, waktu)
+) WITH CLUSTERING ORDER BY (waktu DESC);
+
+-- Bentuk 3: Composite partition key (partition key lebih dari 1 kolom) + clustering
+-- Perhatikan kurung DOUBLE ((...)) pada bagian partition key
+-- Contoh: data sensor, dipecah per sensor PER HARI supaya partisi tidak membengkak
+CREATE TABLE sensor_by_hari (
+    sensor_id uuid,
+    tanggal   date,
+    waktu     timestamp,
+    suhu      double,
+    PRIMARY KEY ((sensor_id, tanggal), waktu)
+) WITH CLUSTERING ORDER BY (waktu DESC);
+
+Cara membaca:
+PRIMARY KEY ((sensor_id, tanggal), waktu)
+             \_____partition____/  \_clustering_/
+
+Perbedaan kurung:
+PRIMARY KEY (a, b, c)      -> partition key = a        ; clustering = b, c
+PRIMARY KEY ((a, b), c)    -> partition key = a dan b  ; clustering = c
+
+Aturan:
+- Primary key TIDAK BISA diubah setelah tabel dibuat (harus bikin tabel baru)
+- Kolom primary key tidak boleh NULL
+- Primary key menentukan identitas baris (kalau INSERT dengan primary key sama, data lama ditimpa)
+
+------------------------------------------------------------------------
+1.6 TABLE OPTIONS (pengaturan tabel)
+------------------------------------------------------------------------
+CREATE TABLE log_aktivitas (
+    user_id uuid,
+    waktu   timeuuid,
+    aksi    text,
+    PRIMARY KEY (user_id, waktu)
+) WITH CLUSTERING ORDER BY (waktu DESC)
+  AND comment = 'Log aktivitas user'
+  AND default_time_to_live = 2592000      -- data otomatis hilang setelah 30 hari
+  AND gc_grace_seconds = 864000;          -- masa simpan tombstone (10 hari)
+
+Opsi yang sering dipakai:
+- comment               -> keterangan tabel
+- default_time_to_live  -> TTL default semua baris (detik)
+- gc_grace_seconds      -> lama tombstone disimpan
+- compaction            -> strategi compaction (dibahas di Bab 8)
+- CLUSTERING ORDER BY   -> arah urutan clustering key
+
+------------------------------------------------------------------------
+1.7 ALTER TABLE
+------------------------------------------------------------------------
+-- Tambah kolom
+ALTER TABLE users ADD no_hp text;
+
+-- Hapus kolom (hanya kolom biasa, bukan kolom primary key)
+ALTER TABLE users DROP no_hp;
+
+-- Ubah opsi tabel
+ALTER TABLE users WITH comment = 'Tabel data user';
+
+Yang TIDAK bisa dilakukan lewat ALTER TABLE:
+- Mengubah primary key
+- Menghapus kolom primary key
+- Mengubah tipe data kolom secara bebas
+
+------------------------------------------------------------------------
+1.8 TRUNCATE dan DROP
+------------------------------------------------------------------------
+TRUNCATE users;        -- kosongkan semua data, struktur tabel tetap ada
+DROP TABLE users;      -- hapus tabel beserta datanya
+DROP COLUMNFAMILY users;   -- sama persis dengan DROP TABLE (istilah lama)
+DROP KEYSPACE belajar_cql; -- hapus keyspace beserta seluruh isi nya (BERBAHAYA)
+
+-- Versi aman:
+DROP TABLE IF EXISTS users;
+DROP KEYSPACE IF EXISTS belajar_cql;
+
+
+========================================================================
+BAB 2 - TIPE DATA
+========================================================================
+
+URUTAN: Dasar -> Waktu -> UUID -> Koleksi -> Tuple -> Frozen -> UDT -> Counter
+
+------------------------------------------------------------------------
+2.1 TIPE DATA DASAR
+------------------------------------------------------------------------
+Teks       : ASCII (hanya karakter ASCII), TEXT / VARCHAR (UTF-8, sama saja)
+Angka bulat: TINYINT (1 byte), SMALLINT (2), INT (4), BIGINT (8), VARINT (tak terbatas)
+Angka desimal: FLOAT (4 byte), DOUBLE (8 byte), DECIMAL (presisi tinggi, cocok untuk uang)
+Logika     : BOOLEAN (true / false)
+Biner      : BLOB (file / gambar / data mentah, ditulis seperti 0xCAFE)
+Alamat IP  : INET
+
+Waktu:
+- DATE       -> tanggal saja, contoh '2026-10-30'
+- TIME       -> jam saja, contoh '13:45:00'
+- TIMESTAMP  -> tanggal + jam, contoh '2026-10-30 13:45:00+0700'
+- DURATION   -> rentang waktu, contoh 1h30m
+
+Identitas unik:
+- UUID      -> ID acak 128-bit, dibuat dengan fungsi uuid()
+- TIMEUUID  -> UUID yang mengandung waktu (urut berdasarkan waktu), dibuat dengan fungsi now()
+
+-- Fungsi bawaan yang sering dipakai:
+-- uuid()             -> buat UUID acak
+-- now()              -> buat TIMEUUID sekarang
+-- toTimestamp(now()) -> TIMEUUID jadi TIMESTAMP
+-- toDate(now())      -> TIMEUUID jadi DATE
+-- currentTimestamp(), currentDate(), currentTime()
+
+-- Tabel contoh berbagai tipe
+CREATE TABLE contoh_tipe (
+    id         uuid PRIMARY KEY,
+    nama       text,
+    umur       int,
+    saldo      decimal,
+    aktif      boolean,
+    lahir      date,
+    jam_masuk  time,
+    dibuat     timestamp,
+    foto       blob
+);
+
+INSERT INTO contoh_tipe (id, nama, umur, saldo, aktif, lahir, jam_masuk, dibuat, foto)
+VALUES (uuid(), 'Faiz', 20, 1500000.50, true, '2005-01-15', '08:30:00', toTimestamp(now()), 0xCAFE);
+
+------------------------------------------------------------------------
+2.2 KOLEKSI: LIST, SET, MAP
+------------------------------------------------------------------------
+Koleksi dipakai untuk data kecil dan terbatas dalam 1 kolom (jangan untuk ribuan item)
+
+LIST<tipe>      -> berurutan, boleh duplikat, akses berdasarkan index
+SET<tipe>       -> tidak berurutan (diurutkan otomatis), TIDAK boleh duplikat
+MAP<kunci,nilai>-> pasangan key-value
+
+CREATE TABLE profil (
+    id     uuid PRIMARY KEY,
+    nama   text,
+    hobi   list<text>,
+    tag    set<text>,
+    kontak map<text, text>
+);
+
+INSERT INTO profil (id, nama, hobi, tag, kontak)
+VALUES (
+    uuid(),
+    'Faiz',
+    ['ngoding', 'ngopi'],
+    {'android', 'kotlin'},
+    {'email': 'faiz@mail.com', 'wa': '0812345'}
+);
+
+-- Mengubah koleksi (anggap kita sudah punya id nya, tulis misal: 11111111-1111-1111-1111-111111111111)
+
+-- LIST
+UPDATE profil SET hobi = hobi + ['gaming']  WHERE id = 11111111-1111-1111-1111-111111111111;  -- tambah di belakang
+UPDATE profil SET hobi = ['baca'] + hobi    WHERE id = 11111111-1111-1111-1111-111111111111;  -- tambah di depan
+UPDATE profil SET hobi = hobi - ['ngopi']   WHERE id = 11111111-1111-1111-1111-111111111111;  -- hapus berdasarkan nilai
+
+-- SET
+UPDATE profil SET tag = tag + {'compose'}   WHERE id = 11111111-1111-1111-1111-111111111111;
+UPDATE profil SET tag = tag - {'android'}   WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- MAP
+UPDATE profil SET kontak['ig'] = '@faiz'    WHERE id = 11111111-1111-1111-1111-111111111111;  -- tambah / ubah 1 key
+UPDATE profil SET kontak = kontak + {'tg': '@faiz2'} WHERE id = 11111111-1111-1111-1111-111111111111;
+DELETE kontak['wa'] FROM profil             WHERE id = 11111111-1111-1111-1111-111111111111;  -- hapus 1 key
+
+Peringatan:
+- Menimpa seluruh koleksi (SET hobi = [...]) = Cassandra membuat tombstone untuk isi lama
+- Gunakan "+" dan "-" kalau hanya ingin menambah / mengurangi
+- Ukuran koleksi maksimal sekitar 64KB dan sebaiknya tetap kecil
+
+------------------------------------------------------------------------
+2.3 TUPLE
+------------------------------------------------------------------------
+Tuple = kumpulan nilai tetap dengan tipe berbeda, jumlah elemen tetap, tanpa nama field
+
+CREATE TABLE lokasi (
+    id     uuid PRIMARY KEY,
+    nama   text,
+    posisi tuple<double, double>   -- (latitude, longitude)
+);
+
+INSERT INTO lokasi (id, nama, posisi) VALUES (uuid(), 'Monas', (-6.1754, 106.8272));
+
+------------------------------------------------------------------------
+2.4 FROZEN
+------------------------------------------------------------------------
+FROZEN = "bekukan" sebuah tipe kompleks menjadi SATU nilai utuh (diserialisasi jadi satu blob)
+
+Konsekuensi:
+- Tidak bisa mengubah sebagian isi, harus menimpa seluruh nilai
+- TAPI boleh dipakai sebagai bagian primary key, atau di dalam koleksi lain
+
+Contoh:
+-- list di dalam map harus frozen
+CREATE TABLE contoh_frozen (
+    id    uuid PRIMARY KEY,
+    jadwal map<text, frozen<list<text>>>
+);
+
+------------------------------------------------------------------------
+2.5 USER DEFINED TYPE (UDT) - tipe data buatan sendiri
+------------------------------------------------------------------------
+UDT = kumpulan field bernama (seperti struct / data class)
+
+-- 1. Buat tipe nya
+CREATE TYPE alamat (
+    jalan    text,
+    kota     text,
+    kode_pos int
+);
+
+-- 2. Pakai di tabel (dibungkus frozen)
+CREATE TABLE pelanggan (
+    id           uuid PRIMARY KEY,
+    nama         text,
+    alamat_rumah frozen<alamat>,
+    alamat_kerja frozen<alamat>
+);
+
+-- 3. Isi data (pakai kurung kurawal dengan nama field)
+INSERT INTO pelanggan (id, nama, alamat_rumah)
+VALUES (uuid(), 'Faiz', {jalan: 'Jl. Mawar 1', kota: 'Jakarta', kode_pos: 12345});
+
+-- 4. Ubah tipe nya (menambah field)
+ALTER TYPE alamat ADD negara text;
+
+-- 5. Mengganti nama field
+ALTER TYPE alamat RENAME kode_pos TO zip;
+
+-- 6. Hapus tipe (tidak boleh kalau masih dipakai tabel)
+DROP TYPE alamat;
+
+-- Melihat
+DESCRIBE TYPES;
+
+------------------------------------------------------------------------
+2.6 COUNTER
+------------------------------------------------------------------------
+Counter = angka khusus untuk hitungan naik turun (jumlah view, like, dll)
+
+Aturan khusus:
+- Tabel yang memakai counter hanya boleh berisi kolom primary key + kolom counter
+- Tidak bisa di-INSERT, hanya UPDATE
+- Tidak bisa diberi TTL
+- Tidak idempotent (kalau retry, nilai bisa naik 2 kali)
+
+CREATE TABLE view_counter (
+    halaman text PRIMARY KEY,
+    jumlah  counter
+);
+
+UPDATE view_counter SET jumlah = jumlah + 1  WHERE halaman = 'home';
+UPDATE view_counter SET jumlah = jumlah + 10 WHERE halaman = 'home';
+UPDATE view_counter SET jumlah = jumlah - 3  WHERE halaman = 'home';
+
+SELECT * FROM view_counter;
+
+
+========================================================================
+BAB 3 - DML (DATA MANIPULATION LANGUAGE): MENGISI & MENGUBAH DATA
+========================================================================
+
+URUTAN: INSERT -> INSERT JSON -> UPDATE -> DELETE -> TTL & TIMESTAMP -> LWT -> BATCH
+
+PERSIAPAN: tabel users yang dipakai di bab ini (kalau tadi sudah di-DROP, buat ulang)
+
+CREATE TABLE IF NOT EXISTS users (
+    id        uuid PRIMARY KEY,
+    nama      text,
+    email     text,
+    tipe_user text
+);
+
+------------------------------------------------------------------------
+3.1 INSERT
+------------------------------------------------------------------------
+INSERT INTO users (id, nama, email, tipe_user)
+VALUES (uuid(), 'Budi', 'budi@mail.com', 'member');
+
+INSERT INTO users (id, nama, email, tipe_user)
+VALUES (11111111-1111-1111-1111-111111111111, 'Andi', 'andi@mail.com', 'admin');
+
+Aturan:
+- Kolom primary key WAJIB diisi
+- Kolom lain boleh dikosongkan (akan bernilai null, tidak memakai ruang disimpan)
+- Kalau primary key sudah ada, data LAMA DITIMPA (tidak error). Ini disebut UPSERT
+
+Hati-hati: menulis NULL secara eksplisit membuat TOMBSTONE
+INSERT INTO users (id, nama, email) VALUES (uuid(), 'Siti', null);   -- buruk, ada tombstone
+INSERT INTO users (id, nama) VALUES (uuid(), 'Siti');                -- baik, kolom email tidak ditulis
+
+------------------------------------------------------------------------
+3.2 INSERT JSON
+------------------------------------------------------------------------
+Cassandra mendukung JSON secara native
+
+INSERT INTO users JSON '{"id": "22222222-2222-2222-2222-222222222222", "nama": "Rian", "email": "rian@mail.com", "tipe_user": "member"}';
+
+-- Kolom yang tidak ada di JSON akan jadi NULL (tombstone) kecuali dipakai DEFAULT UNSET
+INSERT INTO users JSON '{"id": "22222222-2222-2222-2222-222222222222", "nama": "Rian Baru"}' DEFAULT UNSET;
+
+------------------------------------------------------------------------
+3.3 UPDATE
+------------------------------------------------------------------------
+UPDATE users SET nama = 'Budi Baru' WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Mengubah beberapa kolom
+UPDATE users SET nama = 'Andi Baru', tipe_user = 'superadmin'
+WHERE id = 11111111-1111-1111-1111-111111111111;
+
+Aturan:
+- WHERE harus memuat SELURUH primary key
+- Tidak bisa UPDATE memakai kolom non-primary key di WHERE
+- UPDATE pada baris yang belum ada = Cassandra membuat baris baru (UPSERT juga!)
+- Cassandra TIDAK membaca data dulu sebelum menulis, jadi UPDATE sangat cepat
+
+Perbandingan:
+INSERT dan UPDATE hasilnya sama (sama-sama upsert). Bedanya hanya sintaks dan
+sedikit perilaku pada baris yang kosong (INSERT membuat "row marker", UPDATE tidak).
+
+------------------------------------------------------------------------
+3.4 DELETE
+------------------------------------------------------------------------
+-- Hapus 1 baris penuh
+DELETE FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Hapus nilai kolom tertentu saja (kolom jadi null)
+DELETE email FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Hapus elemen koleksi
+DELETE kontak['wa'] FROM profil WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Hapus berdasarkan range clustering key (pada tabel pesan_by_chat)
+DELETE FROM pesan_by_chat
+WHERE chat_id = 33333333-3333-3333-3333-333333333333
+  AND waktu < '2026-01-01';
+
+Ingat: DELETE = membuat TOMBSTONE, bukan menghapus fisik langsung.
+
+------------------------------------------------------------------------
+3.5 TTL (Time To Live) dan TIMESTAMP
+------------------------------------------------------------------------
+TTL: data otomatis hilang setelah sekian DETIK
+
+-- Data ini hilang setelah 60 detik (cocok untuk OTP, session, cache)
+INSERT INTO users (id, nama) VALUES (uuid(), 'Sementara') USING TTL 60;
+
+-- Pada UPDATE
+UPDATE users USING TTL 3600 SET tipe_user = 'trial'
+WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Cek sisa TTL
+SELECT nama, TTL(nama) FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+
+TIMESTAMP: setiap penulisan punya timestamp (mikrodetik), data dengan timestamp TERBARU yang menang
+-- Cek kapan kolom ditulis
+SELECT nama, WRITETIME(nama) FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+
+-- Menentukan timestamp sendiri (jarang dipakai, tapi berguna untuk migrasi data)
+INSERT INTO users (id, nama) VALUES (uuid(), 'Lama') USING TIMESTAMP 1700000000000000;
+
+------------------------------------------------------------------------
+3.6 LIGHTWEIGHT TRANSACTION (LWT) - IF NOT EXISTS / IF
+------------------------------------------------------------------------
+Masalah: karena INSERT = UPSERT, bagaimana kalau kita TIDAK mau menimpa data yang sudah ada?
+Solusi: LWT (memakai protokol Paxos untuk menjamin hanya satu penulis yang menang)
+
+-- Hanya insert kalau belum ada
+INSERT INTO users (id, nama, email)
+VALUES (44444444-4444-4444-4444-444444444444, 'Dewi', 'dewi@mail.com')
+IF NOT EXISTS;
+
+-- Hasil nya berupa kolom [applied] : true atau false
+
+-- Update bersyarat
+UPDATE users SET email = 'dewi_baru@mail.com'
+WHERE id = 44444444-4444-4444-4444-444444444444
+IF email = 'dewi@mail.com';
+
+-- Delete bersyarat
+DELETE FROM users WHERE id = 44444444-4444-4444-4444-444444444444 IF EXISTS;
+
+Peringatan: LWT sekitar 4x lebih lambat dari write biasa. Pakai hanya kalau benar-benar perlu
+(contoh: registrasi username unik, rebutan stok terakhir).
+
+------------------------------------------------------------------------
+3.7 BATCH
+------------------------------------------------------------------------
+Batch = menjalankan beberapa perubahan dalam satu permintaan.
+
+Jenis nya:
+a. LOGGED BATCH (default)   -> atomic: semua berhasil atau semua gagal (ada overhead tambahan)
+b. UNLOGGED BATCH           -> tanpa jaminan atomic lintas partisi, lebih ringan
+c. COUNTER BATCH            -> khusus untuk update counter
+
+-- Logged batch (default)
+BEGIN BATCH
+    INSERT INTO users (id, nama) VALUES (uuid(), 'Andi');
+    UPDATE users SET nama = 'Siti' WHERE id = 11111111-1111-1111-1111-111111111111;
+APPLY BATCH;
+
+-- Unlogged batch
+BEGIN UNLOGGED BATCH
+    INSERT INTO users (id, nama) VALUES (uuid(), 'A');
+    INSERT INTO users (id, nama) VALUES (uuid(), 'B');
+APPLY BATCH;
+
+-- Counter batch
+BEGIN COUNTER BATCH
+    UPDATE view_counter SET jumlah = jumlah + 1 WHERE halaman = 'home';
+    UPDATE view_counter SET jumlah = jumlah + 1 WHERE halaman = 'blog';
+APPLY BATCH;
+
+KESALAHAN UMUM: Orang mengira BATCH membuat insert lebih cepat seperti di SQL.
+DI CASSANDRA TIDAK. Batch itu untuk ATOMICITY, bukan untuk performa.
+- Batch berisi banyak partisi berbeda membebani coordinator node dan bisa membuat timeout
+- Gunakan batch terutama untuk menjaga konsistensi antar tabel hasil denormalisasi
+  (contoh: update users_by_id dan users_by_email bersamaan)
+
+Contoh batch yang benar (denormalisasi, menulis ke 2 tabel yang isi nya sama):
+BEGIN BATCH
+    INSERT INTO users_by_id    (id, email, nama) VALUES (55555555-5555-5555-5555-555555555555, 'x@mail.com', 'X');
+    INSERT INTO users_by_email (email, id, nama) VALUES ('x@mail.com', 55555555-5555-5555-5555-555555555555, 'X');
+APPLY BATCH;
+(tabel users_by_id dan users_by_email dibuat di Bab 5)
+
+
+========================================================================
+BAB 4 - DQL (DATA QUERY LANGUAGE): MEMBACA DATA
+========================================================================
+
+URUTAN: SELECT -> WHERE -> Range -> ORDER BY -> LIMIT -> IN -> Fungsi Aggregate -> GROUP BY -> SELECT JSON -> ALLOW FILTERING -> Paging
+
+PERSIAPAN: isi data dulu supaya ada yang di-select
+
+INSERT INTO pesan_by_chat (chat_id, waktu, pengirim, isi) VALUES (33333333-3333-3333-3333-333333333333, '2026-10-30 08:00:00', 'Faiz', 'Halo');
+INSERT INTO pesan_by_chat (chat_id, waktu, pengirim, isi) VALUES (33333333-3333-3333-3333-333333333333, '2026-10-30 08:05:00', 'Budi', 'Halo juga');
+INSERT INTO pesan_by_chat (chat_id, waktu, pengirim, isi) VALUES (33333333-3333-3333-3333-333333333333, '2026-10-30 08:10:00', 'Faiz', 'Lagi ngapain?');
+INSERT INTO pesan_by_chat (chat_id, waktu, pengirim, isi) VALUES (33333333-3333-3333-3333-333333333333, '2026-10-30 08:15:00', 'Budi', 'Lagi belajar Cassandra');
+
+------------------------------------------------------------------------
+4.1 SELECT dasar
+------------------------------------------------------------------------
+SELECT * FROM users;                              -- semua data (hati-hati di tabel besar, ini full scan)
+SELECT nama, email FROM users;                    -- kolom tertentu
+SELECT nama AS nama_user FROM users;              -- alias
+SELECT DISTINCT chat_id FROM pesan_by_chat;       -- DISTINCT hanya untuk partition key
+
+------------------------------------------------------------------------
+4.2 WHERE - ATURAN UTAMA
+------------------------------------------------------------------------
+ATURAN 1: Partition key WAJIB ada di WHERE, memakai = atau IN
+SELECT * FROM pesan_by_chat WHERE chat_id = 33333333-3333-3333-3333-333333333333;       -- BENAR
+
+ATURAN 2: Clustering key harus dipakai BERURUTAN dari kiri, dan hanya kolom TERAKHIR yang boleh range
+-- Tabel: PRIMARY KEY ((sensor_id, tanggal), waktu)
+SELECT * FROM sensor_by_hari
+WHERE sensor_id = 66666666-6666-6666-6666-666666666666
+  AND tanggal = '2026-10-30';                                          -- BENAR (semua partition key)
+
+SELECT * FROM sensor_by_hari
+WHERE sensor_id = 66666666-6666-6666-6666-666666666666
+  AND tanggal = '2026-10-30'
+  AND waktu >= '2026-10-30 08:00:00'
+  AND waktu <  '2026-10-30 12:00:00';                                  -- BENAR (range di clustering key)
+
+SELECT * FROM sensor_by_hari
+WHERE sensor_id = 66666666-6666-6666-6666-666666666666;                -- SALAH, partition key tidak lengkap (tanggal tidak ada)
+
+SELECT * FROM pesan_by_chat WHERE pengirim = 'Faiz';                   -- SALAH, bukan bagian primary key
+
+ATURAN 3: Tidak ada OR, tidak ada LIKE, tidak ada JOIN
+
+------------------------------------------------------------------------
+4.3 Range pada clustering key
+------------------------------------------------------------------------
+SELECT * FROM pesan_by_chat
+WHERE chat_id = 33333333-3333-3333-3333-333333333333
+  AND waktu > '2026-10-30 08:00:00';
+
+SELECT * FROM pesan_by_chat
+WHERE chat_id = 33333333-3333-3333-3333-333333333333
+  AND waktu >= '2026-10-30 08:00:00'
+  AND waktu <= '2026-10-30 08:10:00';
+
+------------------------------------------------------------------------
+4.4 ORDER BY
+------------------------------------------------------------------------
+Aturan:
+- Hanya bisa pada CLUSTERING KEY
+- Harus ada partition key di WHERE
+- Arah nya harus sama dengan CLUSTERING ORDER BY pada tabel, atau kebalikan persis nya
+
+-- Tabel pesan_by_chat diurutkan waktu DESC. Maka:
+SELECT * FROM pesan_by_chat WHERE chat_id = 33333333-3333-3333-3333-333333333333 ORDER BY waktu DESC;  -- sesuai
+SELECT * FROM pesan_by_chat WHERE chat_id = 33333333-3333-3333-3333-333333333333 ORDER BY waktu ASC;   -- kebalikan, boleh
+
+------------------------------------------------------------------------
+4.5 LIMIT dan PER PARTITION LIMIT
+------------------------------------------------------------------------
+-- 2 pesan terbaru dari 1 chat
+SELECT * FROM pesan_by_chat
+WHERE chat_id = 33333333-3333-3333-3333-333333333333
+LIMIT 2;
+
+-- Ambil maksimal 1 baris dari SETIAP partisi
+SELECT * FROM pesan_by_chat PER PARTITION LIMIT 1;
+
+------------------------------------------------------------------------
+4.6 IN
+------------------------------------------------------------------------
+-- IN pada partition key (jangan terlalu banyak nilai, tiap nilai = 1 permintaan ke node)
+SELECT * FROM users WHERE id IN (11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222);
+
+------------------------------------------------------------------------
+4.7 Fungsi Aggregate bawaan
+------------------------------------------------------------------------
+SELECT COUNT(*) FROM pesan_by_chat WHERE chat_id = 33333333-3333-3333-3333-333333333333;
+SELECT MIN(waktu), MAX(waktu) FROM pesan_by_chat WHERE chat_id = 33333333-3333-3333-3333-333333333333;
+SELECT SUM(suhu), AVG(suhu) FROM sensor_by_hari
+WHERE sensor_id = 66666666-6666-6666-6666-666666666666 AND tanggal = '2026-10-30';
+
+Peringatan: SELECT COUNT(*) FROM tabel_besar (tanpa WHERE) sangat lambat karena scan seluruh cluster.
+
+CATATAN KOREKSI untuk catatan lamamu:
+   SELECT nama, COUNT(*) FROM nama_tbl WHERE id = ... ALLOW FILTERING;
+Contoh itu kurang baik: mencampur kolom biasa dengan COUNT(*) tanpa GROUP BY hasilnya membingungkan,
+dan ALLOW FILTERING tidak diperlukan kalau WHERE sudah memakai partition key (id).
+Versi benar:
+   SELECT COUNT(*) FROM nama_tbl WHERE id = ...;
+
+------------------------------------------------------------------------
+4.8 GROUP BY (Cassandra 3.10+)
+------------------------------------------------------------------------
+GROUP BY hanya bisa pada partition key / clustering key (berurutan dari kiri)
+
+-- Hitung jumlah pesan per partisi
+SELECT chat_id, COUNT(*) FROM pesan_by_chat GROUP BY chat_id;
+
+------------------------------------------------------------------------
+4.9 SELECT JSON
+------------------------------------------------------------------------
+SELECT JSON id, nama FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+-- Hasil: [json] {"id": "11111111-...", "nama": "Andi Baru"}
+
+SELECT JSON * FROM users;
+
+------------------------------------------------------------------------
+4.10 ALLOW FILTERING (HINDARI!)
+------------------------------------------------------------------------
+Memaksa Cassandra memfilter kolom yang bukan primary key dengan cara scan banyak data
+
+SELECT * FROM users WHERE tipe_user = 'admin' ALLOW FILTERING;
+
+Mengapa berbahaya:
+- Cassandra harus membaca banyak partisi lalu membuang yang tidak cocok
+- Di tabel kecil terasa cepat, tapi di tabel jutaan baris bisa timeout
+- Tidak boleh ada di kode produksi
+
+Solusi yang benar: bikin tabel baru dengan primary key yang sesuai (lihat Bab 5)
+
+------------------------------------------------------------------------
+4.11 TOKEN, PAGING, dan TRACING
+------------------------------------------------------------------------
+-- Melihat token dari partition key
+SELECT id, token(id) FROM users;
+
+-- Paging di cqlsh (tampilkan 5 baris per halaman)
+PAGING 5;
+
+-- Mengintip proses query (sangat berguna untuk belajar)
+TRACING ON;
+SELECT * FROM users WHERE id = 11111111-1111-1111-1111-111111111111;
+TRACING OFF;
+
+
+========================================================================
+BAB 5 - DATA MODELING (INTI CASSANDRA)
+========================================================================
+
+URUTAN: Query-first -> Satu tabel satu query -> Denormalisasi -> Partition sizing -> Secondary Index -> Materialized View -> Static Column
+
+------------------------------------------------------------------------
+5.1 QUERY-FIRST DESIGN
+------------------------------------------------------------------------
+Di SQL: rancang entitas (users, orders) dulu, baru pikirkan query nya.
+Di Cassandra: tulis DAFTAR QUERY dulu, baru rancang tabel nya.
+
+Contoh kebutuhan aplikasi:
+Q1. Cari user berdasarkan ID
+Q2. Cari user berdasarkan email (untuk login)
+Q3. Tampilkan 20 pesan terbaru dalam sebuah chat
+Q4. Tampilkan semua user dengan tipe tertentu
+
+Langkah:
+1. Tulis semua query (seperti di atas)
+2. Tentukan kolom yang dipakai di WHERE  -> jadi PARTITION KEY
+3. Tentukan kolom untuk pengurutan / range -> jadi CLUSTERING KEY
+4. Satu query = satu tabel
+
+------------------------------------------------------------------------
+5.2 SATU TABEL UNTUK SATU QUERY (DENORMALISASI)
+------------------------------------------------------------------------
+-- Q1: cari berdasarkan ID
+CREATE TABLE users_by_id (
+    id    uuid PRIMARY KEY,
+    nama  text,
+    email text
+);
+
+-- Q2: cari berdasarkan email  (data nya DUPLIKAT dengan tabel di atas, dan itu NORMAL di Cassandra)
+CREATE TABLE users_by_email (
+    email text PRIMARY KEY,
+    id    uuid,
+    nama  text
+);
+
+-- Q3: pesan terbaru dalam chat (sudah dibuat di Bab 1)
+SELECT * FROM pesan_by_chat WHERE chat_id = ... LIMIT 20;
+
+-- Q4: user berdasarkan tipe, dengan urutan nama
+CREATE TABLE users_by_tipe (
+    tipe_user text,
+    nama      text,
+    id        uuid,
+    PRIMARY KEY (tipe_user, nama, id)
+);
+
+Prinsip: storage murah, query lambat itu mahal. Maka kita duplikasi data demi kecepatan baca.
+Aplikasi (atau BATCH) bertugas menulis ke semua tabel tersebut.
+
+------------------------------------------------------------------------
+5.3 PARTITION SIZING (JANGAN BIARKAN PARTISI MEMBENGKAK)
+------------------------------------------------------------------------
+Panduan kasar: 1 partisi sebaiknya di bawah 100MB dan di bawah sekitar 100.000 baris
+
+Masalah:
+PRIMARY KEY (sensor_id, waktu) -> 1 sensor mengirim data tiap detik, selama bertahun-tahun
+                                  = 1 partisi tumbuh tanpa batas (HOT / WIDE PARTITION)
+
+Solusi: BUCKETING (pecah partisi berdasarkan waktu)
+PRIMARY KEY ((sensor_id, tanggal), waktu)     -> 1 partisi = 1 sensor, 1 hari
+(inilah alasan tabel sensor_by_hari dibuat seperti itu di Bab 1)
+
+Masalah lain, HOT PARTITION: terlalu banyak trafik menumpuk ke 1 partition key
+Contoh buruk: PRIMARY KEY (negara, ...) dimana 90% user dari 'ID'
+Solusi: tambahkan komponen lain agar data tersebar lebih merata
+
+------------------------------------------------------------------------
+5.4 SECONDARY INDEX
+------------------------------------------------------------------------
+Index di kolom non-primary key, supaya bisa WHERE tanpa ALLOW FILTERING
+
+CREATE INDEX idx_tipe_user ON users (tipe_user);
+
+SELECT * FROM users WHERE tipe_user = 'admin';     -- sekarang boleh
+
+DROP INDEX idx_tipe_user;
+
+Kapan baik:
+- Kardinalitas RENDAH sampai SEDANG (contoh: status, tipe)
+- Query selalu menyertakan partition key juga
+
+Kapan JANGAN:
+- Kolom kardinalitas SANGAT TINGGI (email, id) -> pakai tabel baru
+- Kolom kardinalitas SANGAT RENDAH (boolean) -> hasilnya terlalu banyak
+- Kolom yang sering di-update / di-delete -> banyak tombstone
+- Query tanpa partition key pada cluster besar -> harus menanyai banyak node
+
+Catatan: Cassandra 5.0 memperkenalkan Storage-Attached Index (SAI) yang jauh lebih baik:
+CREATE INDEX idx_nama ON users (nama) USING 'sai';
+
+------------------------------------------------------------------------
+5.5 MATERIALIZED VIEW (MV)
+------------------------------------------------------------------------
+MV = tabel turunan yang otomatis disinkronkan Cassandra dari tabel utama
+Fungsinya sama dengan denormalisasi manual, tapi Cassandra yang menjaga sinkronisasi nya.
+
+CREATE MATERIALIZED VIEW users_by_tipe_mv AS
+    SELECT id, nama, tipe_user
+    FROM users
+    WHERE id IS NOT NULL AND tipe_user IS NOT NULL
+    PRIMARY KEY (tipe_user, id);
+
+SELECT * FROM users_by_tipe_mv WHERE tipe_user = 'admin';
+
+DROP MATERIALIZED VIEW users_by_tipe_mv;
+
+Aturan:
+- Semua kolom primary key tabel asal harus ada di primary key MV
+- Boleh menambah MAKSIMAL 1 kolom non-primary key tabel asal ke primary key MV
+- Semua kolom primary key MV harus diberi "IS NOT NULL" di WHERE
+- Tidak bisa INSERT / UPDATE langsung ke MV
+
+Peringatan: di dokumentasi Cassandra, MV masih ditandai kurang stabil (experimental) dan
+banyak tim produksi memilih denormalisasi manual atau SAI. Pelajari konsep nya, tapi hati-hati memakainya di produksi.
+
+------------------------------------------------------------------------
+5.6 STATIC COLUMN
+------------------------------------------------------------------------
+Kolom STATIC = nilai nya SAMA untuk semua baris dalam satu partisi (disimpan sekali per partisi)
+Hanya bisa dipakai di tabel yang punya clustering key
+
+CREATE TABLE pesanan_by_user (
+    user_id    uuid,
+    nama_user  text STATIC,        -- sama untuk semua pesanan user ini
+    pesanan_id timeuuid,
+    produk     text,
+    PRIMARY KEY (user_id, pesanan_id)
+);
+
+INSERT INTO pesanan_by_user (user_id, nama_user) VALUES (77777777-7777-7777-7777-777777777777, 'Faiz');
+INSERT INTO pesanan_by_user (user_id, pesanan_id, produk) VALUES (77777777-7777-7777-7777-777777777777, now(), 'Keyboard');
+INSERT INTO pesanan_by_user (user_id, pesanan_id, produk) VALUES (77777777-7777-7777-7777-777777777777, now(), 'Mouse');
+
+SELECT * FROM pesanan_by_user WHERE user_id = 77777777-7777-7777-7777-777777777777;
+-- nama_user 'Faiz' muncul di kedua baris tetapi tersimpan hanya sekali
+
+
+========================================================================
+BAB 6 - FITUR LANJUTAN: FUNCTION, AGGREGATE, TRIGGER
+========================================================================
+Catatan: ini fitur yang JARANG dipakai di praktik nyata. Pelajari sekedar tahu.
+
+------------------------------------------------------------------------
+6.1 USER DEFINED FUNCTION (UDF)
+------------------------------------------------------------------------
+Syarat: aktifkan dulu di cassandra.yaml -> enable_user_defined_functions: true
+(dimatikan default karena alasan keamanan)
+
+-- Fungsi menghitung kuadrat
+CREATE FUNCTION IF NOT EXISTS kuadrat (input int)
+    RETURNS NULL ON NULL INPUT
+    RETURNS int
+    LANGUAGE java
+    AS 'return input * input;';
+
+-- Memakai nya
+SELECT kuadrat(umur) FROM contoh_tipe;
+
+DROP FUNCTION kuadrat;
+
+Penjelasan opsi:
+- RETURNS NULL ON NULL INPUT  -> kalau input null, hasil langsung null (fungsi tidak dijalankan)
+- CALLED ON NULL INPUT        -> fungsi tetap dijalankan walau input null
+- LANGUAGE java               -> bahasa yang dipakai (java, atau javascript pada versi lama)
+
+------------------------------------------------------------------------
+6.2 USER DEFINED AGGREGATE (UDA)
+------------------------------------------------------------------------
+Aggregate dibangun dari fungsi:
+- SFUNC     = fungsi state, dipanggil untuk SETIAP baris
+- STYPE     = tipe data state
+- FINALFUNC = fungsi akhir untuk menghasilkan hasil (opsional)
+- INITCOND  = nilai awal state
+
+Contoh: rata-rata custom (state = jumlah baris dan total nilai)
+
+CREATE FUNCTION state_rata (state tuple<int, bigint>, val int)
+    CALLED ON NULL INPUT
+    RETURNS tuple<int, bigint>
+    LANGUAGE java
+    AS 'if (val != null) { state.setInt(0, state.getInt(0) + 1); state.setLong(1, state.getLong(1) + val.intValue()); } return state;';
+
+CREATE FUNCTION final_rata (state tuple<int, bigint>)
+    CALLED ON NULL INPUT
+    RETURNS double
+    LANGUAGE java
+    AS 'if (state.getInt(0) == 0) return null; double r = state.getLong(1); r /= state.getInt(0); return Double.valueOf(r);';
+
+CREATE AGGREGATE rata_rata_custom (int)
+    SFUNC state_rata
+    STYPE tuple<int, bigint>
+    FINALFUNC final_rata
+    INITCOND (0, 0);
+
+SELECT rata_rata_custom(umur) FROM contoh_tipe;
+
+DROP AGGREGATE rata_rata_custom;
+
+CATATAN KOREKSI untuk catatan lamamu:
+   CREATE AGGREGATE rata_rata_custom (int) SFUNC hitung_rata STYPE int INITCOND 0;
+Itu tidak bisa menghitung rata-rata, karena STYPE int hanya menyimpan 1 angka.
+Untuk rata-rata kita butuh 2 nilai (jumlah dan banyak data), maka STYPE dipakai tuple seperti contoh di atas.
+
+------------------------------------------------------------------------
+6.3 TRIGGER
+------------------------------------------------------------------------
+Trigger = menjalankan kode Java kustom otomatis saat ada penulisan data
+Syarat: kelas Java sudah dibuat, di-compile jadi .jar, dan ditaruh di folder triggers/ pada setiap node
+
+CREATE TRIGGER trg_user ON users USING 'org.apache.cassandra.triggers.InvertedIndex';
+
+DROP TRIGGER trg_user ON users;
+
+Peringatan: trigger berjalan di jalur write, jadi kode yang lambat memperlambat SEMUA penulisan.
+Banyak tim memilih memproses di sisi aplikasi atau memakai Change Data Capture (CDC) sebagai gantinya.
+
+
+========================================================================
+BAB 7 - DCL (DATA CONTROL LANGUAGE): KEAMANAN & HAK AKSES
+========================================================================
+
+URUTAN: Aktifkan Authentication -> Role -> User (sintaks lama) -> Grant -> Revoke -> List
+
+------------------------------------------------------------------------
+7.1 AKTIFKAN AUTENTIKASI
+------------------------------------------------------------------------
+Default Cassandra: tidak ada login (siapa pun bisa masuk). Untuk memakai DCL ubah cassandra.yaml:
+
+authenticator: PasswordAuthenticator
+authorizer: CassandraAuthorizer
+
+Lalu restart. Akun bawaan: username cassandra, password cassandra
+LANGKAH PERTAMA di produksi: buat superuser baru, lalu matikan / ganti password akun bawaan.
+
+------------------------------------------------------------------------
+7.2 ROLE
+------------------------------------------------------------------------
+Di Cassandra modern, USER dan GROUP digabung menjadi satu konsep: ROLE
+Role yang punya LOGIN = true berarti bisa dipakai login (berfungsi sebagai user)
+Role tanpa LOGIN berfungsi sebagai grup hak akses
+
+-- Superuser
+CREATE ROLE admin_baru WITH PASSWORD = 'password123' AND LOGIN = true AND SUPERUSER = true;
+
+-- Role biasa untuk aplikasi
+CREATE ROLE app_user WITH PASSWORD = 'rahasia' AND LOGIN = true;
+
+-- Role sebagai grup (tidak bisa login)
+CREATE ROLE tim_baca_saja;
+
+ALTER ROLE admin_baru WITH PASSWORD = 'passwordbaru';
+DROP ROLE admin_baru;
+
+------------------------------------------------------------------------
+7.3 USER (SINTAKS LAMA)
+------------------------------------------------------------------------
+Masih berjalan, tetapi sebenarnya alias dari ROLE
+
+CREATE USER nama_user WITH PASSWORD 'secret';
+CREATE USER admin2 WITH PASSWORD 'secret' SUPERUSER;
+ALTER USER nama_user WITH PASSWORD 'new_secret';
+DROP USER nama_user;
+LIST USERS;
+
+Untuk belajar baru, utamakan ROLE.
+
+------------------------------------------------------------------------
+7.4 GRANT & REVOKE (HAK AKSES)
+------------------------------------------------------------------------
+Jenis permission:
+- SELECT    -> boleh baca
+- MODIFY    -> boleh INSERT, UPDATE, DELETE, TRUNCATE
+- CREATE    -> boleh membuat keyspace / tabel
+- ALTER     -> boleh mengubah
+- DROP      -> boleh menghapus
+- AUTHORIZE -> boleh memberi hak akses ke orang lain
+- DESCRIBE  -> boleh melihat daftar role
+- EXECUTE   -> boleh menjalankan fungsi
+- ALL PERMISSIONS -> semua
+
+Level cakupan (dari luas ke sempit):
+ALL KEYSPACES -> KEYSPACE -> TABLE
+
+GRANT SELECT ON KEYSPACE belajar_cql TO tim_baca_saja;
+GRANT SELECT ON TABLE belajar_cql.users TO app_user;
+GRANT MODIFY ON KEYSPACE belajar_cql TO app_user;
+GRANT ALL PERMISSIONS ON ALL KEYSPACES TO admin_baru;
+
+REVOKE MODIFY ON KEYSPACE belajar_cql FROM app_user;
+REVOKE SELECT ON KEYSPACE belajar_cql FROM tim_baca_saja;
+
+-- Pewarisan: memberikan role (grup) ke role lain
+GRANT tim_baca_saja TO app_user;     -- app_user sekarang mewarisi semua hak tim_baca_saja
+REVOKE tim_baca_saja FROM app_user;
+
+------------------------------------------------------------------------
+7.5 LIST
+------------------------------------------------------------------------
+LIST ROLES;
+LIST USERS;
+LIST ALL PERMISSIONS;
+LIST ALL PERMISSIONS OF app_user;
+LIST PERMISSIONS ON KEYSPACE belajar_cql;
+
+Prinsip: Berikan hak akses SEMINIMAL mungkin (principle of least privilege).
+Aplikasi biasanya cukup SELECT + MODIFY saja, tidak perlu DROP / ALTER.
+
+
+========================================================================
+BAB 8 - UTILITY & OPERASIONAL
+========================================================================
+
+URUTAN: Perintah cqlsh -> nodetool -> Compaction -> Repair -> Backup (Snapshot) -> Monitoring
+
+------------------------------------------------------------------------
+8.1 PERINTAH cqlsh (bukan CQL, hanya berlaku di terminal cqlsh)
+------------------------------------------------------------------------
+HELP;                         -- bantuan
+HELP SELECT;                  -- bantuan per topik
+DESCRIBE KEYSPACES;           -- daftar keyspace
+DESCRIBE KEYSPACE belajar_cql;
+DESCRIBE TABLES;
+DESCRIBE TABLE users;
+DESCRIBE TYPES;
+DESCRIBE CLUSTER;             -- info cluster
+CONSISTENCY;                  -- lihat CL saat ini
+CONSISTENCY QUORUM;           -- ubah CL
+SERIAL CONSISTENCY SERIAL;    -- CL khusus LWT
+PAGING 20;                    -- jumlah baris per halaman
+TRACING ON;                   -- tampilkan jejak eksekusi
+EXPAND ON;                    -- tampilan vertikal (satu kolom per baris)
+SOURCE '/path/file.cql';      -- jalankan file .cql
+COPY users TO 'users.csv' WITH HEADER = true;       -- ekspor ke CSV
+COPY users FROM 'users.csv' WITH HEADER = true;     -- impor dari CSV
+CLEAR;
+EXIT;
+
+------------------------------------------------------------------------
+8.2 nodetool (perintah di terminal biasa, bukan di dalam cqlsh)
+------------------------------------------------------------------------
+nodetool status                   -- status semua node (UN = Up Normal, DN = Down Normal)
+nodetool info                     -- info node ini
+nodetool ring                     -- lihat token ring
+nodetool tablestats belajar_cql.users   -- statistik tabel (ukuran, jumlah tombstone, dll)
+nodetool flush                    -- paksa memtable ditulis ke SSTable
+nodetool compact                  -- paksa compaction
+nodetool repair                   -- sinkronkan data antar replika
+nodetool snapshot -t nama_backup belajar_cql   -- buat backup (snapshot)
+nodetool clearsnapshot            -- hapus snapshot
+nodetool drain                    -- persiapan sebelum shutdown
+nodetool cfstats                  -- nama lama dari tablestats
+
+------------------------------------------------------------------------
+8.3 COMPACTION
+------------------------------------------------------------------------
+Compaction = menggabungkan SSTable lama menjadi lebih sedikit, membuang data usang dan tombstone kadaluarsa
+
+Strategi (diatur per tabel):
+- SizeTieredCompactionStrategy (STCS)   -> default, cocok untuk beban tulis tinggi
+- LeveledCompactionStrategy (LCS)       -> cocok untuk beban baca tinggi
+- TimeWindowCompactionStrategy (TWCS)   -> cocok untuk data time-series dengan TTL (log, sensor)
+
+ALTER TABLE sensor_by_hari
+WITH compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_unit': 'DAYS',
+    'compaction_window_size': 1
+};
+
+------------------------------------------------------------------------
+8.4 REPAIR
+------------------------------------------------------------------------
+Saat ada node mati sementara atau write gagal ke sebagian replika, data antar replika bisa tidak sinkron.
+Repair = membandingkan dan menyamakan data antar replika
+
+nodetool repair belajar_cql
+nodetool repair -full belajar_cql
+
+Aturan penting: jalankan repair secara rutin, paling tidak sekali dalam rentang gc_grace_seconds
+(default 10 hari). Kalau tidak, data yang sudah dihapus bisa "hidup kembali" (zombie data).
+
+------------------------------------------------------------------------
+8.5 BACKUP
+------------------------------------------------------------------------
+- Snapshot       : salinan hard-link SSTable (instan, hampir tanpa makan ruang di awal)
+- Incremental    : menyimpan SSTable baru setelah snapshot
+- Restore        : copy SSTable snapshot ke folder data, lalu "nodetool refresh" atau pakai sstableloader
+
+nodetool snapshot -t backup_30okt belajar_cql
+nodetool listsnapshots
+
+------------------------------------------------------------------------
+8.6 MONITORING (tahu nama nya saja dulu)
+------------------------------------------------------------------------
+- nodetool tpstats          -> status thread pool (cari yang Pending / Blocked banyak)
+- nodetool tablehistograms  -> latency & ukuran partisi
+- Log: system.log, debug.log
+- Metrics via JMX -> Prometheus / Grafana
+
+
+========================================================================
+BAB 9 - RINGKASAN & CHEAT SHEET
+========================================================================
+
+URUTAN BELAJAR SATU BARIS:
+Konsep Dasar -> Keyspace -> Replication -> Table -> Primary Key -> Tipe Data -> Koleksi -> Tuple -> Frozen -> UDT -> Counter
+-> INSERT -> UPDATE -> DELETE -> TTL -> LWT -> BATCH
+-> SELECT -> WHERE -> ORDER BY -> LIMIT -> ALLOW FILTERING
+-> Data Modeling -> Index -> Materialized View -> Static
+-> Function -> Aggregate -> Trigger
+-> Role -> Grant -> Revoke
+-> cqlsh -> nodetool -> Compaction -> Repair -> Backup
+
+TABEL PERBANDINGAN SQL vs CQL:
+SQL                      | Cassandra CQL
+-------------------------+-------------------------------------------------
+Database                 | Keyspace
+Table                    | Table (Columnfamily)
+Primary key (1 identitas)| Partition key + Clustering key
+JOIN                     | Tidak ada (denormalisasi)
+WHERE bebas              | WHERE harus mengikuti primary key
+Normalisasi              | Denormalisasi (satu tabel satu query)
+INSERT vs UPDATE         | Sama-sama UPSERT
+DELETE langsung hapus    | DELETE membuat tombstone
+Transaksi ACID penuh     | Atomic per partisi + LWT untuk kasus khusus
+AUTO_INCREMENT           | Tidak ada, pakai UUID / TIMEUUID
+
+KESALAHAN YANG SERING TERJADI:
+1. Merancang tabel seperti SQL (normalisasi) -> harus query-first
+2. Memakai ALLOW FILTERING -> bikin tabel baru dengan primary key yang sesuai
+3. Mengira BATCH lebih cepat -> batch itu untuk atomicity, bukan performa
+4. Menulis NULL eksplisit -> menimbulkan tombstone
+5. Partisi tumbuh tanpa batas -> pakai bucketing (tanggal / bulan)
+6. Memakai secondary index di kolom kardinalitas tinggi -> bikin tabel baru
+7. Terlalu sering DELETE / pola queue -> tombstone menumpuk, query lambat
+8. Tidak pernah menjalankan repair -> data zombie
+9. Memakai SimpleStrategy di produksi multi-datacenter -> pakai NetworkTopologyStrategy
+10. COUNT(*) pada tabel besar tanpa WHERE -> sangat lambat
+
+LATIHAN MANDIRI (supaya benar-benar paham):
+1. Buat keyspace "toko" dengan SimpleStrategy RF=1
+2. Buat tabel produk_by_id, produk_by_kategori (primary key beda, data sama)
+3. Insert 10 produk ke kedua tabel memakai BATCH
+4. Buat tabel riwayat_harga dengan partition key (produk_id) dan clustering key (waktu DESC), ambil 3 harga terbaru
+5. Buat tabel stok memakai LWT agar stok tidak bisa dipesan 2 kali (UPDATE ... IF stok > 0)
+6. Buat tabel kunjungan_halaman memakai counter
+7. Buat tabel otp_login dengan TTL 120 detik
+8. Buat UDT alamat dan simpan sebagai frozen<alamat> pada tabel pelanggan
+9. Buat role "kasir" yang hanya boleh SELECT dan MODIFY di keyspace toko
+10. Aktifkan TRACING ON dan bandingkan query memakai partition key vs ALLOW FILTERING
+
+========================================================================
+SELESAI - Kalau semua bab sudah dipraktikkan, kamu sudah menguasai CQL
+dari konsep sampai operasional.
+========================================================================
